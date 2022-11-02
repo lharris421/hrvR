@@ -1,0 +1,11 @@
+.Rproj.user
+*.Rproj
+.Rhistory
+.RData
+.Ruserdata
+/strava_new
+/strava_old
+/example_files
+/gravel_files
+/trainning_files
+.DS_Store

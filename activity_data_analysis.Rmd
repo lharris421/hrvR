@@ -1,0 +1,189 @@
+---
+title: "Activity Data Analysis"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## libraries
+library(bit64)
+library(ggplot2)
+library(magrittr)
+library(janitor)
+library(data.table)
+library(lubridate)
+library(stringr)
+library(FITfileR)
+library(dplyr)
+```
+
+# Activity Details
+
+```{r, warning = FALSE}
+activity_details <- fread("./strava_new/activities.csv") %>%
+  clean_names()
+
+activity_details %<>%
+  dplyr::mutate(activity_date = mdy_hms(activity_date), distance = as.numeric(distance)) %>%
+  dplyr::filter(activity_type %in% c("Ride", "Virtual Ride")) %>%
+  dplyr::filter(activity_date >= ymd("2022-10-20")) %>%
+  dplyr::arrange(activity_date)
+```
+
+# File Processing
+
+- activity_id is unique identifier
+- save hr zones for now
+
+```{r}
+out_file <- data.frame(activity_id = integer64(), Z1 = numeric(), Z2 = numeric(),
+                       Z3 = numeric(), Z4 = numeric(), Z5 = numeric())
+
+for (i in 1:nrow(activity_details)) {
+  
+  act_id <- activity_details$activity_id[i]
+  
+  fname <- paste0("./strava_new/", str_remove(activity_details$filename[i], ".gz"))
+  recs <- records(readFitFile(fname))
+  if (!("list" %in% class(recs))) {recs <- list(recs)}
+  hr_data <- do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate))) %>%
+    dplyr::arrange(timestamp) %>%
+    dplyr::mutate(tdiff = c(1, diff(timestamp)),
+                  orig = 1)
+  
+  # %>%
+  #   mutate(time_diff = c(NA, diff(timestamp))) %>%
+  #   dplyr::filter(is.na(time_diff) | time_diff < 15)
+  
+  min_time <- min(hr_data$timestamp)
+  max_time <- max(hr_data$timestamp)
+  all_times <-  seq(min_time, max_time, by = 1)
+  all_times <- all_times[!(all_times %in% hr_data$timestamp)]
+  all_ts <- data.frame(timestamp = all_times, heart_rate = NA) 
+  
+  hr_data %<>% full_join(all_ts) %>%
+    arrange(timestamp) %>%
+    mutate(bef = heart_rate,
+           aft = heart_rate) %>%
+    tidyr::fill(bef, .direction = "down") %>%
+    tidyr::fill(aft, .direction = "up") %>%
+    tidyr::fill(tdiff, .direction = "up") %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(bef_weight = n():1) %>%
+    ungroup() %>%
+    arrange(desc(timestamp)) %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(aft_weight = n():1) %>%
+    ungroup() %>%
+    arrange(timestamp) %>%
+    mutate(heart_rate = ifelse(is.na(heart_rate), (bef*bef_weight + aft*aft_weight) / (bef_weight + aft_weight), heart_rate)) %>% arrange(timestamp) %>%
+    dplyr::mutate(
+      zone = case_when(
+        heart_rate <= 142 ~ "Z1",
+        heart_rate <= 158 ~ "Z2",
+        heart_rate <= 168 ~ "Z3",
+        heart_rate <= 177 ~ "Z4",
+        TRUE ~ "Z5"
+      )
+    ) %>%
+    filter(tdiff < 15 | orig == 1) %>%
+    group_by(zone) %>%
+    summarise(hrs = n() / 3600) %>%
+    ungroup() %>%
+    tidyr::pivot_wider(names_from = zone, 
+                values_from = hrs) %>%
+    mutate(activity_id = act_id)
+  
+  out_file <- bind_rows(out_file, hr_data)
+
+}
+# Inside mutate:
+ # level = case_when(
+ #      zone %in% c(1, 2) ~ "Low",
+ #      zone == 3 ~ "Moderate",
+ #      TRUE ~ "High"
+ #    )
+
+zone_dist <- out_file %>%
+  select(-activity_id) %>%
+  summarise_all(sum, na.rm = TRUE)
+
+zone_dist <- zone_dist / sum(zone_dist)
+
+zone_dist %>%
+  mutate(low = Z1 + Z2, mod = Z3, high = Z4 + Z5) %>%
+  select(low, mod, high)
+```
+
+
+```{r}
+slope_data <- data.frame(
+  week = c(seq(0, 2, 1)),
+  slope = c(rep(.1, 3))
+)
+
+weekly_hr_dist <- out_file %>%
+  mutate(day = (lubridate::wday(activity_details$activity_date) %% 7) + 1,
+         week = cumsum(day == 1)) %>%
+  mutate_all(~ifelse(is.na(.), 0, .)) %>%
+  mutate(low = Z1 + Z2, mod = Z3, high = Z4 + Z5) %>%
+  select(week, low, mod, high) %>%
+  group_by(week) %>%
+  summarise_all(sum) %>%
+  mutate(total = low + mod + high) %>%
+  tidyr::pivot_longer(cols = low:total, names_to = "level", values_to = "hrs") %>%
+  mutate(level = factor(level, levels = c("total", "low", "mod", "high"))) %>%
+  group_by(week) %>%
+  mutate(perc = round((hrs / sum(hrs))*200, 1))
+          
+## Params
+min_week <- min(slope_data$week)
+max_week <- max(slope_data$week)
+largest_hours <- max(weekly_hr_dist$hrs)
+##
+
+xs <- seq(min_week - 1, max_week + 1, 1)
+ints <- seq(-1, ceiling(largest_hours) + 1, .5)
+line_data <- expand.grid("x" = xs, "int" = ints) %>%
+  left_join(slope_data, by = c("x" = "week")) %>%
+  mutate(grp = rep(1:length(ints), each = length(xs))) %>%
+  group_by(grp) %>%
+  tidyr::fill(slope, .direction = "updown") %>%
+  mutate(y = int*((1+slope)^x)) %>%
+  mutate(color = ifelse(int == 5.5, "red", "black"))
+
+
+ggplot() +
+  geom_line(data = line_data, aes(x = x, y = y, group = grp, color = color), alpha = .2) + 
+  geom_bar(data = weekly_hr_dist, aes(x = week, y = hrs, fill = level),
+           stat = "identity", position = position_dodge(), alpha = .8, width = .8) +
+  theme_bw() + 
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + 
+  coord_cartesian(ylim=c(0, largest_hours), xlim = c(min_week - 0.5, max_week + .5)) +
+  geom_text(data = weekly_hr_dist, aes(x = week + c(-.1, .1, .3, -.3), y = hrs, label = round(hrs, 2)), fontface = "bold", vjust = 1.5, size = 2.5) +
+  geom_text(data = weekly_hr_dist, aes(x = week + c(-.1, .1, .3, -.3), y = hrs, label = paste0(perc, " %")), fontface = "bold", vjust = -.5, size = 2.5)
+
+```
+
+
+# Goals
+
+- Build (10%)
+  - 7 build to 12 hours
+- Maintain (flat line)
+- Later build to 16 hours
+
+# Heart rate totals per 7 day period
+
+- Add 10% slope
+- Break down in to total, low, moderate, high intensity
+
+# Heart Rate Distribution Past 14 Days
+
+

@@ -1,0 +1,810 @@
+---
+title: "FIT Files"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(FITfileR)
+library(magrittr)
+library(dplyr)
+library(zoo)
+library(KFAS)
+library(tseries)
+library(timeSeries)
+library(quantmod)
+library(lubridate)
+library(readr)
+library(data.table)
+library(janitor)
+library(bit64)
+library(stringr)
+library(fGarch)
+library(splines)
+library(ggplot2)
+library(rugarch)
+
+## Exploring ideas
+
+## recs <- records(readFitFile("Lunch_Gravel_Ride.fit")) 
+recs <- records(readFitFile("example_files/Afternoon_Gravel_Ride.fit")) 
+hr_data <- do.call(rbind, lapply(recs, function(x) x %>% select(timestamp, heart_rate))) %>%
+  arrange(timestamp) %>%
+  mutate(time_diff = c(NA, diff(timestamp))) %>%
+  dplyr::filter(!is.na(time_diff))  %>%
+  mutate(brk = cumsum(time_diff > 15) + 1) %>%
+  mutate(heart_rate = 60000 / heart_rate)
+
+vals <- numeric()
+
+## s_fit <- garchFit(~arma(0,0) + garch(1,1), data = hr_data$heart_rate)
+s_fit <- arma(hr_data$heart_rate, order = c(3, 3))
+## s_fit <- ugarchfit(spec = ugarchspec(), data = hr_data$heart_rate)
+vals <- fitted(s_fit)
+vals <- as.numeric(vals)
+
+
+hr_data$vals <- vals
+hr_data$centered_hr <- hr_data$heart_rate - vals
+
+hr_data %<>%
+  dplyr::filter(!is.na(centered_hr))
+
+ggplot(hr_data, aes(x = timestamp, y = vals, group = brk)) +
+  geom_line()
+
+ggplot(hr_data, aes(x = timestamp, y = heart_rate, group = brk)) +
+  geom_line()
+
+ggplot(hr_data, aes(x = timestamp, y = centered_hr, group = brk)) +
+  geom_line()
+
+plot(hr_data$timestamp, hr_data$heart_rate, type = "l")
+lines(hr_data$timestamp, hr_data$vals, col = "red")
+
+
+plot(hr_data$timestamp, s_fit@fit$sigma, type ="l")
+plot(hr_data$heart_rate, log(s_fit@fit$sigma), type ="p")
+```
+
+## Showing BIC continues to select overly complex model
+
+```{r}
+bics <- numeric(200)
+for (i in 1:200) {
+  
+  bics[i] <- BIC(lm(heart_rate ~ ns(timestamp, df = 300 + i), data = hr_data))
+  
+}
+
+plot(1:200, bics)
+```
+
+
+## Use spline to remove mean trend
+
+```{r}
+activity_details <- fread("./strava/activities.csv") %>%
+  clean_names()
+
+activity_details %<>%
+  dplyr::mutate(activity_date = mdy_hms(activity_date), distance = as.numeric(distance)) %>%
+  dplyr::filter(activity_type %in% c("Ride", "Virtual Ride")) %>%
+  dplyr::filter(activity_date <= ymd("2022-02-01") & activity_date >= ymd("2021-08-15")) %>%
+  ## dplyr::mutate(year = year(activity_date), month = month(activity_date), day = day(activity_date)) %>%
+  ## dplyr::group_by(year, month, day) %>%
+  dplyr::arrange(activity_date) %>%
+  dplyr::mutate(time_diff = c(NA, diff(as.numeric(activity_date))),
+                last_time = dplyr::lag(elapsed_time),
+                time_diff = time_diff - last_time,
+                new_group = cumsum(ifelse(time_diff > 3600 & !is.na(time_diff), 1, 0))) %>%
+  ## dplyr::ungroup() %>%
+  dplyr::group_by(new_group) %>%
+  dplyr::mutate(occurance = 1:n(), total_distance = sum(distance), moc = max(occurance)) %>%
+  dplyr::ungroup()  %>%
+  dplyr::filter(distance > 16 | moc >= 2)
+
+preds <- numeric(nrow(activity_details))
+omega <- numeric(nrow(activity_details))
+alpha1 <- numeric(nrow(activity_details))
+beta1 <- numeric(nrow(activity_details))
+dates <- numeric(nrow(activity_details))
+slopes <- numeric(nrow(activity_details))
+## 163, 177
+aerobic <- numeric(nrow(activity_details))
+thresh <- numeric(nrow(activity_details))
+act_type <- activity_details$activity_type
+
+i <- 1
+while (i <= nrow(activity_details)) {
+  
+  recs <- records(readFitFile(paste0("./strava/", str_remove(activity_details$filename[i], ".gz"))))
+      
+  if (!("list" %in% class(recs))) {recs <- list(recs)}
+  
+  hr_data <- do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate))) %>%
+    dplyr::arrange(timestamp)
+  
+  print(i)
+  
+  while (i + 1 < nrow(activity_details) && activity_details$occurance[i + 1] != 1) {
+    
+    i <- i + 1
+    
+    recs <- records(readFitFile(paste0("./strava/", str_remove(activity_details$filename[i], ".gz"))))
+      
+    if (!("list" %in% class(recs))) {recs <- list(recs)}
+  
+    hr_data <- hr_data %>%
+      bind_rows(do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate)))) %>%
+      dplyr::arrange(timestamp)
+    
+  }
+  
+  hr_data <- hr_data %>%
+    mutate(time_diff = c(NA, diff(timestamp))) %>%
+    dplyr::filter(!is.na(time_diff))  %>%
+    mutate(brk = cumsum(time_diff > 15) + 1) %>%
+    dplyr::filter(heart_rate > 40)
+
+  
+  tryCatch({
+    
+    vals <- numeric()
+    for (j in 1:length(unique(hr_data$brk))) {
+    
+     ##  print(j)
+      tmp <- hr_data %>%
+        dplyr::filter(brk == j)
+      
+      s_fit <- lm(heart_rate ~ ns(timestamp, df = round(sum(as.numeric(diff(tmp$timestamp))) / 60)), data = tmp)
+      ## s_fit <- arma(tmp$heart_rate, order = c(1, 1))
+      vals <- c(vals, s_fit$fitted.values)
+    
+    }
+
+      hr_data$vals <- vals
+      hr_data$centered_hr <- hr_data$heart_rate - vals
+      
+      hr_data %<>%
+        dplyr::filter(!is.na(centered_hr))
+      
+      ride_garch <- garchFit(centered_hr~garch(1,0), data = hr_data, trace = FALSE)
+      mod <- lm(log(ride_garch@sigma.t) ~ heart_rate, data = hr_data)
+      slopes[i] <- coef(mod)[2]
+      aerobic[i] <- predict(mod, data.frame(heart_rate = 163))
+      thresh[i] <- predict(mod, data.frame(heart_rate = 177))
+      dates[i] <- as.numeric(date(min(hr_data$timestamp)))
+      omega[i] <- ride_garch@fit$coef[2]
+      alpha1[i] <- ride_garch@fit$coef[3]
+      ## beta1[i] <- ride_garch@fit$coef[4]
+      
+      lm()
+      
+    },
+           error = function(e) {
+             preds[i] <- NA
+             dates[i] <- NA
+             }
+  )
+  
+  i <- i + 1
+  
+}
+
+dates <- dates[!(omega == 0)]
+act_type <- act_type[!(omega == 0)]
+slopes <- slopes[!(omega == 0)]
+aerobic <- aerobic[!(omega == 0)]
+thresh <- thresh[!(omega == 0)]
+alpha1 <- alpha1[!(alpha1 == 0)]
+omega <- omega[!(omega == 0)]
+## beta1 <- beta1[!(beta1 == 0)]
+
+plot(dates, omega, type = "l")
+
+plot(dates, alpha1, type = "l")
+abline(lm(alpha1[act_type != "Ride"] ~ dates[act_type != "Ride"]), col = "red")
+
+plot(dates, alpha1, type = "p", col = c("blue", "red")[1 + (act_type == "Ride")])
+## plot(dates, beta1, type = "l")
+plot(dates, slopes, type = "l")
+plot(dates, aerobic, type = "l")
+plot(dates, thresh, type = "l")
+
+##
+summary(lm(alpha1[act_type != "Ride"] ~ dates[act_type != "Ride"]))
+summary(lm(alpha1 ~ dates))
+```
+
+
+# Can splines get the job done?
+
+## Polynomial with white noise
+
+```{r}
+x <- seq(0, 90, by = 1/20)
+
+plot(x, (-.00075*x^3 + .0575*x^2 - 17)*(x > 20 & x <= 80) -.2*(x - 20)^2*(x <= 20) + 160 - 33*(x > 80), type = "l")
+y_init <- (-.00075*x^3 + .0575*x^2 - 17)*(x > 20 & x <= 80) -.2*(x - 20)^2*(x <= 20) + 160 - 33*(x > 80)
+
+sfit <- lm(y_init ~ ns(x, 10))
+y_true <- sfit$fitted.values
+
+plot(x, y_true, type = "l")
+
+
+## White noise
+wn <- arima.sim(model = list(order = c(0, 0, 0)), n = length(x), sd = 10)
+plot.ts(wn)
+
+##
+wn_series <- y_true + wn
+plot(x, wn_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:100
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  
+  bics[i] <- BIC(lm(wn_series ~ ns(x, df = i)))
+  
+}
+
+plot(dfs, bics)
+which.min(bics)
+pred_series_wn <- fitted(lm(wn_series ~ ns(x, df = which.min(bics))))
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+```
+
+## ARMA (1, 1)
+
+```{r}
+arma_noise <- arima.sim(model = list(ar = .5, ma = .5), n = length(x), sd = 10)
+plot.ts(arma_noise)
+
+arma_series <- y_true + arma_noise
+
+plot(x, arma_series, type = "l")
+plot(x, wn_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:100
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  bics[i] <- BIC(lm(arma_series ~ ns(x, df = i)))
+  
+}
+
+plot(dfs, bics)
+which.min(bics)
+pred_series_arma <- fitted(lm(arma_series ~ ns(x, df = which.min(bics))))
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+lines(x, pred_series_arma, col = "blue")
+```
+
+## GARCH
+
+```{r}
+garch_noise <- garchSim(spec = garchSpec(model = list(omega = 81, alpha = .2, beta = .2, mu = 100)), n = length(x))
+
+garch_noise <- garch_noise$garch - mean(garch_noise$garch)
+plot.ts(garch_noise)
+
+garch_series <- y_true + garch_noise
+
+plot(x, garch_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:100
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  bics[i] <- BIC(lm(garch_series ~ ns(x, df = i)))
+  
+}
+
+plot(dfs, bics)
+which.min(bics)
+pred_series_garch <- fitted(lm(garch_series ~ ns(x, df = which.min(bics))))
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+lines(x, pred_series_arma, col = "blue")
+lines(x, pred_series_garch, col = "green")
+```
+
+## ARMA GARCH
+
+
+```{r}
+arma_garch_noise <- garchSim(spec = garchSpec(model = list(omega = .15, alpha = .2, beta = .75, ar = .98, ma = .3, mu = 2)), n = length(x))
+arma_garch_noise <- arma_garch_noise$garch - mean(arma_garch_noise$garch)
+arma_garch_noise <- arma_garch_noise * .6
+plot.ts(arma_garch_noise)
+
+arma_garch_series <- y_true + arma_garch_noise 
+
+plot(x, arma_garch_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:400
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  bics[i] <- BIC(lm(arma_garch_series ~ ns(x, df = i)))
+  
+}
+
+plot(dfs, bics)
+which.min(bics)
+pred_series_arma_garch <- fitted(lm(arma_garch_series ~ ns(x, df = which.min(bics))))
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+lines(x, pred_series_arma, col = "blue")
+lines(x, pred_series_garch, col = "green")
+lines(x, pred_series_arma_garch, col = "purple")
+legend("bottom", legend = c("Truth", "White Noise", "ARMA", "GARCH", "ARMA + GARCH"),
+       col = c("black", "red", "blue", "green", "purple"), lty = 1)
+```
+
+
+## TRUE ARMA + GARCH NOISE
+
+
+
+```{r}
+gexp <- expand.grid(0:4, 0:4, 0:4, 0:4)
+gexp <- gexp %>%
+  dplyr::mutate(f1 = Var1 + Var2, f2 = Var3 + Var4) %>%
+  dplyr::filter(Var3 != 0 & f1 != 0)
+bics_exp <- numeric(nrow(gexp))
+for (j in 1:nrow(gexp)) {
+  
+  ar1 <- gexp[j,1]
+  ma1 <- gexp[j,2]
+  a1 <- gexp[j,3]
+  b1 <- gexp[j,4]
+  
+  if (j %% 10 == 0) {print(j)}
+  
+    tryCatch({
+    
+      tmp <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(ar1, ma1)),
+                                         variance.model = list(garchOrder = c(a1, b1))), data = arma_garch_series)
+    
+      
+      bics_exp[j] <- -2*tmp@fit$LLH + length(tmp@fit$coef)*log(length(arma_garch_series))
+      
+    },
+           error = function(e) {
+             print("SHHHHHH")
+             bics_exp[j] <- 9999
+             }
+  )
+ 
+}
+
+
+gexp[which.min(bics_exp),]
+min(bics_exp)
+
+s_fit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(2, 3)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = arma_garch_series)
+vals <- fitted(s_fit)
+mean_vals <- as.numeric(vals)
+
+plot(x, y_true, type = "l")
+lines(x, arma_garch_series, col = "blue")
+## lines(x, pred_series_arma_garch, col = "purple")
+lines(x, mean_vals, col = "orange")
+
+plot.ts(s_fit@fit$sigma)
+```
+
+
+
+
+## Selectiong the best model
+
+```{r}
+## Exploring ideas
+recs <- records(readFitFile("Afternoon_Gravel_Ride.fit")) 
+## recs <- records(readFitFile("Lunch_Gravel_Ride.fit")) 
+hr_data <- do.call(rbind, lapply(recs, function(x) x %>% select(timestamp, heart_rate))) %>%
+  arrange(timestamp) %>%
+  mutate(time_diff = c(NA, diff(timestamp))) %>%
+  dplyr::filter(!is.na(time_diff))  %>%
+  mutate(brk = cumsum(time_diff > 15) + 1) %>%
+  mutate(heart_rate = 60000 / heart_rate)
+
+# gexp <- expand.grid(4:6, 4:6, 0:2, 0:2)
+# gexp <- gexp %>%
+#   dplyr::mutate(f1 = Var1 + Var2, f2 = Var3 + Var4) %>%
+#   dplyr::filter(Var3 != 0 & f1 != 0)
+# bics_exp <- numeric(nrow(gexp))
+# for (j in 1:nrow(gexp)) {
+#   
+#   ar1 <- gexp[j,1]
+#   ma1 <- gexp[j,2]
+#   a1 <- gexp[j,3]
+#   b1 <- gexp[j,4]
+#   
+#   if (j %% 10 == 0) {print(j)}
+#   
+#     tryCatch({
+#     
+#       tmp <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(ar1, ma1)),
+#                                          variance.model = list(garchOrder = c(a1, b1))), data = hr_data$heart_rate)
+#     
+#       
+#       bics_exp[j] <- -2*tmp@fit$LLH + length(tmp@fit$coef)*log(length(hr_data$heart_rate))
+#       
+#     },
+#            error = function(e) {
+#              print("SHHHHHH")
+#              bics_exp[j] <- 9999
+#              }
+#   )
+#  
+# }
+
+
+hr_data %<>%
+  group_by(brk) %>%
+  mutate(idx = 1:n()) %>%
+  ungroup() %>%
+  dplyr::filter(idx > 10)
+
+
+
+sfit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(1, 0)),
+                                         variance.model = list(garchOrder = c(1, 10))), data = hr_data$heart_rate)
+
+plot.ts(sfit@fit$sigma)
+ys <- sfit@fit$sigma
+xs <- 60000 / hr_data$heart_rate
+
+dat_pred <- bind_cols(ys, xs)
+colnames(dat_pred) <- c("Y", "X")
+mod <- lm(Y ~ X + I(X^2), dat_pred)
+predict(mod, newdata = data.frame(X = 150))
+
+plot(xs, ys)
+lines(xs, mod$fitted.values, col = "red")
+```
+
+
+## TEST
+
+```{r}
+i <- 1
+while (i <= nrow(activity_details)) {
+  
+  recs <- records(readFitFile(paste0("./strava/", str_remove(activity_details$filename[i], ".gz"))))
+      
+  if (!("list" %in% class(recs))) {recs <- list(recs)}
+  
+  hr_data <- do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate))) %>%
+    dplyr::arrange(timestamp)
+  
+  ## hr_data <- do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate))) 
+  
+  print(i)
+  
+  while (i + 1 < nrow(activity_details) && activity_details$occurance[i + 1] != 1) {
+    
+    i <- i + 1
+    
+    recs <- records(readFitFile(paste0("./strava/", str_remove(activity_details$filename[i], ".gz"))))
+      
+    if (!("list" %in% class(recs))) {recs <- list(recs)}
+  
+    hr_data <- hr_data %>%
+      bind_rows(do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate)))) %>%
+      dplyr::arrange(timestamp)
+    
+  }
+  
+  min_time <- min(hr_data$timestamp)
+  max_time <- max(hr_data$timestamp)
+  all_times <-  seq(min_time, max_time, by = 1)
+  all_times <- all_times[!(all_times %in% hr_data$timestamp)]
+  
+  if (length(all_times) > 0) {
+    
+   all_ts <- data.frame(timestamp = all_times, heart_rate = NA)  
+   hr_data %<>% full_join(all_ts) %>%
+    arrange(timestamp) %>%
+    mutate(bef = heart_rate,
+           aft = heart_rate) %>%
+    tidyr::fill(bef, .direction = "down") %>%
+    tidyr::fill(aft, .direction = "up") %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(bef_weight = n():1) %>%
+    ungroup() %>%
+    arrange(desc(timestamp)) %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(aft_weight = n():1) %>%
+    ungroup() %>%
+    arrange(timestamp) %>%
+    mutate(heart_rate = ifelse(is.na(heart_rate), (bef*bef_weight + aft*aft_weight) / (bef_weight + aft_weight), heart_rate))
+    
+  }
+
+  
+  hr_data <- hr_data %>%
+    mutate(heart_rate = 60000 / heart_rate) %>%
+    mutate(tp = 1:n()) %>%
+    dplyr::filter(tp > 600)
+
+  
+  tryCatch({
+
+
+    sfit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(1, 1)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = hr_data$heart_rate)
+
+    plot.ts(sfit@fit$sigma)
+    ys <- sfit@fit$sigma
+    xs <- 60000 / hr_data$heart_rate
+    
+    dat_pred <- bind_cols(ys, xs)
+    colnames(dat_pred) <- c("Y", "X")
+    mod <- lm(Y ~ X + I(X^2), dat_pred)
+    aerobic[i] <- predict(mod, newdata = data.frame(X = 150))
+    dates[i] <- as.numeric(date(min(hr_data$timestamp)))
+      
+    },
+           error = function(e) {
+             dates[i] <- NA
+            }
+  )
+  
+  i <- i + 1
+  
+}
+
+saved <- list(dates, act_type, aerobic)
+
+dates <- dates[!(aerobic == 0)]
+act_type <- act_type[!(aerobic == 0)]
+aerobic <- aerobic[!(aerobic == 0)]
+
+plot(dates, aerobic, type = "l")
+abline(lm(aerobic[act_type != "Ride"] ~ dates[act_type != "Ride"]), col = "red")
+
+plot(dates, aerobic, type = "p", col = c("blue", "red")[1 + (act_type == "Ride")])
+## plot(dates, beta1, type = "l")
+
+
+##
+summary(lm(alpha1[act_type != "Ride"] ~ dates[act_type != "Ride"]))
+summary(lm(alpha1 ~ dates))
+```
+
+
+
+## BSTS
+
+```{r}
+library(bsts)
+
+recs <- records(readFitFile("example_files/Afternoon_Gravel_Ride.fit")) 
+recs <- records(readFitFile("example_files/Lunch_Gravel_Ride.fit")) 
+if (!("list" %in% class(recs))) {recs <- list(recs)}
+hr_data <- do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate))) %>%
+    dplyr::arrange(timestamp) %>%
+    dplyr::mutate(tdiff = c(1, diff(timestamp)),
+                  orig = 1)
+  
+  min_time <- min(hr_data$timestamp)
+  max_time <- max(hr_data$timestamp)
+  all_times <-  seq(min_time, max_time, by = 1)
+  all_times <- all_times[!(all_times %in% hr_data$timestamp)]
+  all_ts <- data.frame(timestamp = all_times, heart_rate = NA) 
+  
+  hr_data %<>% full_join(all_ts) %>%
+    arrange(timestamp) %>%
+    mutate(bef = heart_rate,
+           aft = heart_rate) %>%
+    tidyr::fill(bef, .direction = "down") %>%
+    tidyr::fill(aft, .direction = "up") %>%
+    tidyr::fill(tdiff, .direction = "up") %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(bef_weight = n():1) %>%
+    ungroup() %>%
+    arrange(desc(timestamp)) %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(aft_weight = n():1) %>%
+    ungroup() %>%
+    arrange(timestamp) %>%
+    mutate(heart_rate = ifelse(is.na(heart_rate), (bef*bef_weight + aft*aft_weight) / (bef_weight + aft_weight), heart_rate)) %>%
+    arrange(timestamp) %>%
+    mutate(heart_rate = 60000 / heart_rate)
+  
+
+ss <- list()
+ss <- bsts::AddLocalLinearTrend(ss, hr_data$heart_rate)
+mod <- bsts::bsts(hr_data$heart_rate, ss, niter = 1000)
+
+pred_errors <- colMeans(mod$one.step.prediction.errors)
+
+plot.ts(pred_errors)
+ 
+sfit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = pred_errors)
+
+plot.ts(sfit@fit$sigma)
+
+
+xs <- 60000 / hr_data$heart_rate
+ys <- sfit@fit$sigma
+
+dat_pred <- bind_cols(ys, xs) %>%
+  arrange(xs)
+colnames(dat_pred) <- c("Y", "X")
+mod_pred <- lm(Y ~ ns(X, 2), dat_pred)
+
+predict(mod_pred, newdata = data.frame(X = 45))
+
+plot(xs, ys)
+lines(seq(100, 190, 1), predict(mod_pred, newdata = data.frame(X = seq(100, 190, 1))), col = "red")
+```
+
+```{r}
+# Select an approximate $\theta$, since theta must be lower than min(y), and greater than zero
+theta.0 <- min(ys) * 0.5  
+
+# Estimate the rest parameters using a linear model
+model.0 <- lm(log(ys - theta.0) ~ xs)  
+alpha.0 <- exp(coef(model.0)[1])
+beta.0 <- coef(model.0)[2]
+
+# Starting parameters
+start <- list(alpha = alpha.0, beta = beta.0, theta = theta.0)
+
+
+mod_pred <- nls(ys ~ alpha * exp(beta * xs) + theta, start = start)
+
+
+plot(xs, ys)
+lines(seq(100, 190, 1), predict(mod_pred, newdata = data.frame(xs = seq(100, 190, 1))), col = "red")
+
+predict(mod_pred, newdata = data.frame(xs = 140)) ## 1.487, 1.432
+
+```
+
+
+## Test 2
+
+## TEST
+
+```{r}
+aerobic <- numeric(nrow(activity_details))
+dates <- numeric(nrow(activity_details))
+act_type <- activity_details$activity_type
+
+i <- 1
+while (i <= nrow(activity_details)) {
+  
+  recs <- records(readFitFile(paste0("./strava/", str_remove(activity_details$filename[i], ".gz"))))
+      
+  if (!("list" %in% class(recs))) {recs <- list(recs)}
+  
+  hr_data <- do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate))) %>%
+    dplyr::arrange(timestamp)
+  
+  print(i)
+  
+  while (i + 1 < nrow(activity_details) && activity_details$occurance[i + 1] != 1) {
+    
+    i <- i + 1
+    
+    recs <- records(readFitFile(paste0("./strava/", str_remove(activity_details$filename[i], ".gz"))))
+      
+    if (!("list" %in% class(recs))) {recs <- list(recs)}
+  
+    hr_data <- hr_data %>%
+      bind_rows(do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate)))) %>%
+      dplyr::arrange(timestamp)
+    
+  }
+  
+  min_time <- min(hr_data$timestamp)
+  max_time <- max(hr_data$timestamp)
+  all_times <-  seq(min_time, max_time, by = 1)
+  all_times <- all_times[!(all_times %in% hr_data$timestamp)]
+  
+  if (length(all_times) > 0) {
+    
+   all_ts <- data.frame(timestamp = all_times, heart_rate = NA)  
+   hr_data %<>% full_join(all_ts) %>%
+    arrange(timestamp) %>%
+    mutate(bef = heart_rate,
+           aft = heart_rate) %>%
+    tidyr::fill(bef, .direction = "down") %>%
+    tidyr::fill(aft, .direction = "up") %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(bef_weight = n():1) %>%
+    ungroup() %>%
+    arrange(desc(timestamp)) %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(aft_weight = n():1) %>%
+    ungroup() %>%
+    arrange(timestamp) %>%
+    mutate(heart_rate = ifelse(is.na(heart_rate), (bef*bef_weight + aft*aft_weight) / (bef_weight + aft_weight), heart_rate))
+    
+  }
+  
+  hr_data <- hr_data %>%
+    mutate(heart_rate = 60000 / heart_rate) %>%
+    mutate(tp = 1:n()) %>%
+    dplyr::filter(tp > 600)
+
+  
+  tryCatch({
+
+
+    sfit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(1, 1)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = hr_data$heart_rate)
+
+    plot.ts(sfit@fit$sigma)
+    ys <- sfit@fit$sigma
+    xs <- 60000 / hr_data$heart_rate
+    
+    dat_pred <- bind_cols(ys, xs)
+    colnames(dat_pred) <- c("Y", "X")
+    mod <- lm(Y ~ X + I(X^2), dat_pred)
+    aerobic[i] <- predict(mod, newdata = data.frame(X = 150))
+    dates[i] <- as.numeric(date(min(hr_data$timestamp)))
+      
+    },
+           error = function(e) {
+             dates[i] <- NA
+            }
+  )
+  
+  i <- i + 1
+  
+}
+
+saved <- list(dates, act_type, aerobic)
+
+dates <- dates[!(aerobic == 0)]
+act_type <- act_type[!(aerobic == 0)]
+aerobic <- aerobic[!(aerobic == 0)]
+
+plot(dates, aerobic, type = "l")
+abline(lm(aerobic[act_type != "Ride"] ~ dates[act_type != "Ride"]), col = "red")
+
+plot(dates, aerobic, type = "p", col = c("blue", "red")[1 + (act_type == "Ride")])
+
+
+##
+summary(lm(alpha1[act_type != "Ride"] ~ dates[act_type != "Ride"]))
+summary(lm(alpha1 ~ dates))
+```
+
