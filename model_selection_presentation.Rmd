@@ -1,0 +1,606 @@
+---
+title: "Extracting Mean Trends in Heart Rate"
+subtitle: "With Splines"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: ioslides_presentation
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+## Libraries
+library(tidyverse)
+library(rugarch)
+library(npreg)
+library(magrittr)
+```
+
+## Motivation : Heart Rate variability (HRV)
+
+- Interested in modeling the variability of heart rate
+- Serves as an indicator of "health" or "balance"
+- We have two branches of our nervous system: Sympathetic and Parasympathetic
+  - Sympathetic: Fight or flight
+  - Parasympathetic: Rest and digest
+- At baseline, the two branches are usually equal in force
+  - Leads to larger variability in heart rate
+  - When out of balance, often due to domination of the sympathetic nervous system, heart rate variability is suppressed
+- Take away: Higher variability is better
+
+## Background
+
+- HRV is usually if not always measured at rest
+- For example, a popular wearable device company, Whoop, measures it during sleep
+  - Within sleep, periods of deep sleep are given more weight
+  - Calculation is done using the Root Mean Square of Successive Differences (RMSSD)
+- Current literature also suggests that calculating HRV is not informative during exercise
+  - Driven by the fact that heart rate varies greatly even during rest, as such during exercise it should be completely uninformative
+- My goal: estimate HRV during exercise
+
+## Assumptions
+
+- HRV is a non-increasing function of heart rate (HR)
+- As heart rate increases away from rest, HRV decreases exponentially towards zero
+- At an individuals maximum heart rate, HRV is close or near zero
+
+## More Background
+
+- HRV is usually measured in milliseconds (ms)
+- HR is measured in beat per minute (BPM)
+- True HRV is measured by considering successive RR intervals (using an ECG)
+- Wearable devices provide data directly in the form of BPM
+- If we take BPM as an instantaneous measure we can crudely approximate the time between successive beats in ms using:
+  - 60,000 / BPM
+- Note that although HRV has the word "variability" in it, its units are ms indicating it is actually a standard deviation
+
+## Set Up : Simulating HR Timeseries
+
+- Assume a HRV of 125 ms at a resting heart rate (RHR) of 50
+- Assume a maximum HR of 190 with HRV of about 1 ms
+- We will be considering a 90 minute activity with HR measurements per second
+- The heart rate will start at 80 BPM and reach a steady state around 150 after 30 minutes
+
+
+```{r, incldude = FALSE}
+starting_hr <- 80
+terminal_hr <- 150 
+ride_length <- 90 ## 90
+observations_per_minute <- 60
+
+minutes_to_terminal <- 30 ## 30
+seconds_to_terminal <- 60 * minutes_to_terminal
+
+## hrs <- terminal_hr - round((terminal_hr - starting_hr + 1)^(1 - (1:seconds_to_terminal / seconds_to_terminal)) - 1)
+min( (terminal_hr - starting_hr)^(1 - (1:seconds_to_terminal / seconds_to_terminal)) )
+hrs <- terminal_hr - (terminal_hr - starting_hr)^(1 - (1:seconds_to_terminal / seconds_to_terminal)) + 1
+hrs <- c(hrs, rep(terminal_hr, (ride_length - minutes_to_terminal) * 60))
+plot.ts(hrs)
+```
+
+
+## Set Up : Simulating HR Timeseries
+
+```{r}
+plot.ts(60000 / hrs)
+```
+
+
+## Set Up : Simulating HR Timeseries
+
+```{r}
+starting_var <- 120
+starting_hr <- 50
+terminal_hr <- 190
+hr_diff <- terminal_hr - starting_hr
+
+var_curve <- ((starting_var)*(exp(- seq(0, hr_diff, 1) / hr_diff ))^4)^2
+matching_hrs <- seq(starting_hr, terminal_hr, length.out = length(var_curve))
+
+plot(matching_hrs, sqrt(var_curve), type = "l")
+min(sqrt(var_curve))
+```
+
+## Simulating time series
+
+```{r}
+plot((60000 / matching_hrs), var_curve, type = "l", xlab = "Time Between Beats (ms)", ylab = "Variance (ms^2)")
+```
+
+## Delta Method
+
+- A somewhat crude application of the delta method
+
+```{r}
+dm <- var_curve * (matching_hrs^4) / (60000^2)
+plot(matching_hrs, sqrt(dm) , type = "l")
+
+dm_smooth <- loess(dm ~ matching_hrs)
+
+## min(sqrt(dm))
+```
+
+## Add some noise
+
+- Okay, now we have the underlying details set, lets add the variability
+- I am going to leverage a simple ar(1) process with $\phi = .98$.
+- However, again, I am going to do something seemingly odd
+- The noise ar(1) process is going to be on the previous deviation from the underlying "truth"
+- Consider adding simulation plot?
+- Then, I will add normal noise based on the previous curve shown above
+- The random sd of the noise will be based on the observed value at the previous time point
+
+```{r}
+set.seed(111322)
+ar_process <- numeric(length(hrs))
+ar_process[1] <- hrs[1]
+ar_addition <- numeric(length(hrs))
+hetero_noise <- numeric(length(hrs))
+for (i in 2:length(hrs)) {
+### for (i in 2:3) {  
+
+  ## flipped back
+  curr_sd <- sqrt(predict(dm_smooth, data.frame(matching_hrs = ar_process[i - 1])))
+  hetero_noise[i] <- rnorm(1, 0, curr_sd)
+  ar_addition[i] <- (.98 * (ar_process[i - 1] - hrs[i - 1]))
+  ar_process[i] <- round(hrs[i] + ar_addition[i] + hetero_noise[i])
+  ar_process[i] <- pmax(50, ar_process[i])
+  ar_process[i] <- pmin(190, ar_process[i])
+  
+  
+}
+
+plot.ts(ar_process)
+
+##
+hr_data <- data.frame(heart_rate = ar_process, timestamp = 1:length(ar_process))
+hr_data <- hr_data[sample(1:nrow(hr_data), 1938),]
+hr_data <- hr_data[hr_data$timestamp <= 60*60,]
+ggplot(hr_data, aes(x = timestamp, y = heart_rate)) +
+  geom_line() +
+  xlab("Time") +
+  ylab("Heart Rate")
+
+
+ggsave(file = "images/lie.png", width = 12, height = 2, dpi = 300)
+
+## Look at even a perfect functional form on the time between model 
+library(lubridate)
+library(FITfileR)
+recs <- records(readFitFile("gravel_files/gravel_rehersal.fit"))
+hr_data <- do.call(rbind, lapply(recs, function(x) x %>% select(timestamp, heart_rate))) %>%
+  arrange(timestamp) %>%
+  mutate(time_diff = c(NA, diff(timestamp))) %>%
+  dplyr::filter(!is.na(time_diff))  %>%
+  mutate(brk = cumsum(time_diff > 15) + 1) %>%
+  filter(timestamp <= min(timestamp) + minutes(60))
+
+ggplot(hr_data, aes(x = seconds(timestamp - min(timestamp)), y = heart_rate)) +
+  geom_line() +
+  xlab("Time") +
+  ylab("Heart Rate")
+
+ggsave(file = "images/truth1.png", width = 12, height = 2, dpi = 300)
+
+recs <- records(readFitFile("gravel_files/example_2.fit"))
+hr_data <- do.call(rbind, lapply(recs, function(x) x %>% select(timestamp, heart_rate))) %>%
+  arrange(timestamp) %>%
+  mutate(time_diff = c(NA, diff(timestamp))) %>%
+  dplyr::filter(!is.na(time_diff))  %>%
+  mutate(brk = cumsum(time_diff > 15) + 1) %>%
+  filter(timestamp <= min(timestamp) + minutes(60))
+
+ggplot(hr_data, aes(x = seconds(timestamp - min(timestamp)), y = heart_rate)) +
+  geom_line() +
+  xlab("Time") +
+  ylab("Heart Rate")
+
+ggsave(file = "images/truth2.png", width = 12, height = 2, dpi = 300)
+```
+
+## Is it working?
+
+```{r, warning = FALSE}
+process_data <- data.frame(noise = hetero_noise, x = ar_process)
+
+hr_seq <- seq(min(ar_process), max(ar_process), by = 1)
+rsd <- numeric(length(hr_seq))
+for (i in 1:length(hr_seq)) {
+  
+  rsd[i] <- process_data %>%
+    filter(abs(x - hr_seq[i]) <= 10) %>%
+    pull(noise) %>%
+    sd()
+  
+}
+
+plot(ar_process, hetero_noise, cex = .05)
+lines(hr_seq, rsd, col = "blue", lwd = 1)
+lines(matching_hrs, sqrt(dm), col = "red", lwd = 1)
+
+## RMSE
+sqrt(mean((sqrt(dm) - rsd)^2)) ## This is "perfect"
+```
+
+
+## Splines, Splines, and More Splines
+
+- b-splines
+- natural splines
+- penalized splines
+
+
+## Measures of interest
+
+- Random CV
+- Patterned CV
+- BIC
+- Something else???
+
+
+```{r, warning = FALSE}
+## Run with AIC
+dat <- data.frame(ar_process, x = 1:length(ar_process))
+mod <- gsm(ar_process ~ x, data = dat, method = "BIC")
+plot(dat$x, hrs + ar_addition, type = "l")
+lines(dat$x, fitted(mod), col = "blue")
+
+## Cross Validation
+objective <- function(lambda, subset, series, x) {
+  
+  series_fit <- series[-subset]
+  x_fit <- x[-subset]
+  mod <- gsm(series_fit ~ x_fit, lambda = lambda, control = list(maxit = 100, epsilon = 1e-10))
+  projected_y <- predict(mod, newdata = data.frame(x_fit = x[subset]))
+  mean((series[subset] - projected_y)^2)
+  
+}
+
+########
+x <- 1:length(ar_process)
+nit <- 10
+lambdas <- numeric(nit)
+for (i in 1:nit) {
+    
+    rem <- sort(sample(1:length(x), round((1/nit)*length(x))))
+    lambdas[i] <- optimise(objective, interval = c(1e-10, 1 - 1e-10), subset = rem, series = ar_process, x = x, tol = 1e-12)$minimum
+    
+}
+
+mean(lambdas)
+
+res <- gsm(ar_process ~ x, lambda = mean(lambdas))
+
+
+########
+
+lambdas <- numeric(nit)
+for (i in 1:nit) {
+    
+    rem <- (1:length(x))[(1:length(x) %% nit) + 1 == i]
+    lambdas[i] <- optimise(objective, interval = c(1e-10, 1 - 1e-10), subset = rem, series = ar_process, x = x, tol = 1e-12)$minimum
+    
+}
+
+mean(lambdas)
+
+res_pattern <- gsm(ar_process ~ x, lambda = mean(lambdas))
+## res_pattern <- gsm(ar_process ~ x, lambda = 1e-03)
+
+plot(x, hrs + ar_addition, type = "l")
+lines(x, fitted(res), col = "red")
+lines(dat$x, fitted(mod), col = "blue")
+lines(x, fitted(res_pattern), col = "green")
+
+plot(x, hrs, type = "l")
+lines(x, fitted(res), col = "red")
+lines(dat$x, fitted(mod), col = "blue")
+lines(x, fitted(res_pattern), col = "green")
+```
+
+
+## Natural spline
+
+
+```{r, warning = FALSE}
+## Run with BIC
+bics <- NA
+dfs <- 1
+decreasing <- TRUE
+library(splines)
+while(decreasing & dfs < 1000) {
+  
+  bics[dfs] <- BIC(lm(ar_process ~ ns(x, df = dfs), data = dat))
+  
+  if (dfs > 50) {
+    
+    last_10 <- min(tail(bics, 50))
+    rest <- min(bics[1:(length(bics) - 50)])
+   
+    if ((rest - last_10) < 2) {decreasing <- FALSE}
+     
+  }
+  
+  dfs <- dfs + 1
+  
+}
+
+plot.ts(bics)
+## 10: 
+## 25: 277
+## 50: 573
+## 100 : 573
+
+dat <- data.frame(ar_process, x = 1:length(ar_process))
+mod <- lm(ar_process ~ ns(x, which.min(bics)), data = dat)
+## mod <- lm(ar_process ~ ns(x, 573), data = dat)
+plot(dat$x, hrs + ar_addition, type = "l")
+lines(dat$x, fitted(mod), col = "blue")
+
+plot.ts(ar_process - fitted(mod))
+
+plot(y = ar_process - fitted(mod), x = ar_process)
+
+
+process_data <- data.frame(noise = ar_process - fitted(mod), x = ar_process)
+hr_seq <- seq(min(ar_process), max(ar_process), by = 1)
+rsd <- numeric(length(hr_seq))
+for (i in 1:length(hr_seq)) {
+  
+  rsd[i] <- process_data %>%
+    filter(abs(x - hr_seq[i]) <= 10) %>%
+    pull(noise) %>%
+    sd()
+  
+}
+
+plot(ar_process, hetero_noise)
+lines(hr_seq, rsd, col = "blue", lwd = 2)
+lines(matching_hrs, sqrt(dm), col = "red", lwd = 2)
+
+sqrt(mean((sqrt(dm) - rsd)^2))
+```
+
+```{r}
+## Cross Validation
+## I am guessing this wont work.... but may as well try!!
+objective <- function(df, subset, series, x) {
+  
+  series_fit <- series[-subset]
+  x_fit <- x[-subset]
+  mod <- lm(series_fit ~ ns(x_fit, round(df)))
+  projected_y <- predict(mod, newdata = data.frame(x_fit = x[subset]))
+  mean((series[subset] - projected_y)^2)
+  
+}
+
+x <- 1:length(ar_process)
+nit <- 10
+dfs <- numeric(nit)
+for (i in 6:nit) {
+    
+    rem <- sort(sample(1:length(x), round((1/nit)*length(x))))
+    dfs[i] <- optimise(objective, interval = c(1, 1000), subset = rem, series = ar_process, x = x)$minimum
+    
+}
+
+df_select <- round(mean(round(dfs)))
+
+res <- lm(ar_process ~ ns(x, df_select))
+res <- lm(ar_process ~ ns(x, 911))
+
+
+dfs <- numeric(nit)
+for (i in 1:nit) {
+    
+    rem <- (1:length(x))[(1:length(x) %% nit) + 1 == i]
+     dfs[i] <- optimise(objective, interval = c(1, 1000), subset = rem, series = ar_process, x = x)$minimum
+    
+}
+
+df_select_pattern <- round(mean(round(dfs)))
+
+res_pattern <- lm(ar_process ~ ns(x, df_select_pattern))
+
+plot(x, hrs + ar_addition, type = "l")
+lines(dat$x, fitted(mod), col = "blue")
+lines(x, fitted(res), col = "red")
+lines(x, fitted(res_pattern), col = "green")
+
+plot.ts(ar_process - fitted(mod))
+plot.ts(ar_process - fitted(res))
+plot.ts(ar_process - fitted(res_pattern))
+
+
+## Using res
+process_data <- data.frame(noise = ar_process - fitted(res), x = ar_process)
+hr_seq <- seq(min(ar_process), max(ar_process), by = 1)
+rsd <- numeric(length(hr_seq))
+for (i in 1:length(hr_seq)) {
+  
+  rsd[i] <- process_data %>%
+    filter(abs(x - hr_seq[i]) <= 10) %>%
+    pull(noise) %>%
+    sd()
+  
+}
+
+plot(ar_process, hetero_noise)
+lines(hr_seq, rsd, col = "blue", lwd = 2)
+lines(matching_hrs, sqrt(dm), col = "red", lwd = 2)
+
+sqrt(mean((sqrt(dm) - rsd)^2)) 
+```
+
+
+## Basis (go with this I think)
+
+
+```{r, warning = FALSE}
+## Run with BIC
+bics <- NA
+dfs <- 1
+decreasing <- TRUE
+library(splines)
+while(decreasing & dfs < 1000) {
+  
+  bics[dfs] <- BIC(lm(ar_process ~ bs(x, df = dfs), data = dat))
+  
+  if (dfs > 50) {
+    
+    last_10 <- min(tail(bics, 50))
+    rest <- min(bics[1:(length(bics) - 50)])
+   
+    if ((rest - last_10) < 2) {decreasing <- FALSE}
+     
+  }
+  
+  dfs <- dfs + 1
+  
+}
+
+plot.ts(bics)
+
+dat <- data.frame(ar_process, x = 1:length(ar_process))
+mod <- lm(ar_process ~ bs(x, which.min(bics)), data = dat)
+plot(dat$x, hrs + ar_addition, type = "l")
+lines(dat$x, fitted(mod), col = "blue")
+
+plot.ts(ar_process - fitted(mod))
+
+plot(y = ar_process - fitted(mod), x = ar_process)
+
+
+process_data <- data.frame(noise = ar_process - fitted(mod), x = ar_process)
+hr_seq <- seq(min(ar_process), max(ar_process), by = 1)
+rsd <- numeric(length(hr_seq))
+for (i in 1:length(hr_seq)) {
+  
+  rsd[i] <- process_data %>%
+    filter(abs(x - hr_seq[i]) <= 10) %>%
+    pull(noise) %>%
+    sd()
+  
+}
+
+plot(ar_process, hetero_noise)
+lines(hr_seq, rsd, col = "blue", lwd = 2)
+lines(matching_hrs, sqrt(dm), col = "red", lwd = 2)
+
+
+## Cross Validation
+## I am guessing this wont work.... but may as well try!!
+objective <- function(df, subset, series, x) {
+  
+  series_fit <- series[-subset]
+  x_fit <- x[-subset]
+  mod <- lm(series_fit ~ bs(x_fit, round(df)))
+  projected_y <- predict(mod, newdata = data.frame(x_fit = x[subset]))
+  mean((series[subset] - projected_y)^2)
+  
+}
+
+x <- 1:length(ar_process)
+nit <- 10
+dfs <- numeric(nit)
+for (i in 6:nit) {
+    
+    rem <- sort(sample(1:length(x), round((1/nit)*length(x))))
+    dfs[i] <- optimise(objective, interval = c(1, 1000), subset = rem, series = ar_process, x = x)$minimum
+    
+}
+
+df_select <- round(mean(round(dfs)))
+
+res <- lm(ar_process ~ bs(x, df_select))
+
+
+dfs <- numeric(nit)
+for (i in 1:nit) {
+    
+    rem <- (1:length(x))[(1:length(x) %% nit) + 1 == i]
+     dfs[i] <- optimise(objective, interval = c(1, 1000), subset = rem, series = ar_process, x = x)$minimum
+    
+}
+
+df_select_pattern <- round(mean(round(dfs)))
+
+res_pattern <- lm(ar_process ~ bs(x, df_select_pattern))
+
+plot(x, hrs + ar_addition, type = "l")
+lines(dat$x, fitted(mod), col = "blue")
+lines(x, fitted(res), col = "red")
+lines(x, fitted(res_pattern), col = "green")
+
+plot.ts(ar_process - fitted(mod))
+plot.ts(ar_process - fitted(res))
+plot.ts(ar_process - fitted(res_pattern))
+
+
+## Using res
+process_data <- data.frame(noise = ar_process - fitted(res), x = ar_process)
+hr_seq <- seq(min(ar_process), max(ar_process), by = 1)
+rsd <- numeric(length(hr_seq))
+for (i in 1:length(hr_seq)) {
+  
+  rsd[i] <- process_data %>%
+    filter(abs(x - hr_seq[i]) <= 10) %>%
+    pull(noise) %>%
+    sd()
+  
+}
+
+plot(ar_process, hetero_noise)
+lines(hr_seq, rsd, col = "blue", lwd = 2)
+lines(matching_hrs, sqrt(dm), col = "red", lwd = 2)
+```
+
+## ARMA garch model???
+
+## Grid search -> should just try this
+
+## Other  model selection measure ?
+
+## Key Takeaways
+
+- The type of spline matters!
+- Simulating data > intuition
+
+
+
+```{r, include=FALSE}
+## Doesn't look too bad
+## Fit a garch model to this to extract the variance
+## Might not be the right thing to show?? 
+garch_fit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                                         variance.model = list(garchOrder = c(5, 5))), data = hetero_noise)
+
+
+## Look at the relationship
+st <- garch_fit@fit$sigma
+
+## Look at the lagged relationship
+plot(ar_process[-length(ar_process)], st[-1])
+
+arp <- ar_process[-length(ar_process)]
+stp <- st[-1]
+
+mod <- loess(stp ~ arp)
+plot(arp, stp)
+lines(matching_hrs, predict(mod, newdata = data.frame(arp = matching_hrs)), col = "blue")
+lines(matching_hrs, sqrt(dm), col = "red")
+
+## Show that it is not the truth
+plot((60000 / matching_hrs)^2, var_curve, type = "l")
+```
+
+
+
+## Fit on the transformed data
+
+```{r}
+tb_process <- 60000 / ar_process
+```
+
+
+

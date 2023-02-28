@@ -1,0 +1,270 @@
+---
+title: "Simulation Study"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(FITfileR)
+library(magrittr)
+library(dplyr)
+# library(zoo)
+# library(KFAS)
+library(tseries)
+# library(timeSeries)
+# library(quantmod)
+library(fGarch)
+library(lubridate)
+library(readr)
+library(data.table)
+library(janitor)
+library(bit64)
+library(stringr)
+library(splines)
+library(ggplot2)
+library(rugarch)
+```
+
+# Can splines get the job done? - A smulation study
+
+## Polynomial with white noise
+
+```{r}
+## X-range : 90 minutes
+x <- seq(0, 90, by = 1/20)
+
+## Setting a mean trend
+y_init <- (-.00075*x^3 + .0575*x^2 - 17)*(x > 20 & x <= 80) -.2*(x - 20)^2*(x <= 20) + 160 - 33*(x > 80)
+plot(x, y_init, type = "l")
+
+## Getting a smooth mean trend with splines
+sfit <- lm(y_init ~ ns(x, 10))
+y_true <- sfit$fitted.values
+
+plot(x, y_true, type = "l")
+
+
+## White noise
+wn <- arima.sim(model = list(order = c(0, 0, 0)), n = length(x), sd = 10)
+plot.ts(wn)
+
+## White noise with series
+wn_series <- y_true + wn
+plot(x, wn_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:100
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  
+  bics[i] <- BIC(lm(wn_series ~ ns(x, df = i)))
+  
+}
+
+## Get with with minimum BIC
+plot(dfs, bics)
+which.min(bics)
+pred_series_wn <- fitted(lm(wn_series ~ ns(x, df = which.min(bics))))
+
+## See how the mean trend fits
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+```
+
+## ARMA (1, 1)
+
+```{r}
+## Add ARMA (1, 1) nosie
+arma_noise <- arima.sim(model = list(ar = .5, ma = .5), n = length(x), sd = 10)
+plot.ts(arma_noise)
+
+arma_series <- y_true + arma_noise
+
+plot(x, arma_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:100
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  bics[i] <- BIC(lm(arma_series ~ ns(x, df = i)))
+  
+}
+
+plot(dfs, bics)
+which.min(bics)
+pred_series_arma <- fitted(lm(arma_series ~ ns(x, df = which.min(bics))))
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+lines(x, pred_series_arma, col = "blue")
+```
+
+## GARCH
+
+```{r}
+garch_noise <- garchSim(spec = garchSpec(model = list(omega = 81, alpha = .2, beta = .2, mu = 100)), n = length(x))
+
+garch_noise <- garch_noise$garch - mean(garch_noise$garch)
+plot.ts(garch_noise)
+
+garch_series <- y_true + garch_noise
+
+plot(x, garch_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:100
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  bics[i] <- BIC(lm(garch_series ~ ns(x, df = i)))
+  
+}
+
+plot(dfs, bics)
+which.min(bics)
+pred_series_garch <- fitted(lm(garch_series ~ ns(x, df = which.min(bics))))
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+lines(x, pred_series_arma, col = "blue")
+lines(x, pred_series_garch, col = "green")
+```
+
+## ARMA GARCH
+
+
+```{r}
+arma_garch_noise <- garchSim(spec = garchSpec(model = list(omega = .15, alpha = .2, beta = .75, ar = .98, ma = .3, mu = 2)), n = length(x))
+arma_garch_noise <- arma_garch_noise$garch - mean(arma_garch_noise$garch)
+arma_garch_noise <- arma_garch_noise * .6
+plot.ts(arma_garch_noise)
+
+arma_garch_series <- y_true + arma_garch_noise 
+
+## Looks most feasible
+plot(x, arma_garch_series, type = "l")
+
+## select spline df based on BIC
+dfs <- 1:400
+bics <- numeric(length(dfs))
+for (i in 1:length(dfs)) {
+  
+  bics[i] <- BIC(lm(arma_garch_series ~ ns(x, df = i)))
+  
+}
+
+plot(dfs, bics)
+which.min(bics)
+pred_series_arma_garch <- fitted(lm(arma_garch_series ~ ns(x, df = which.min(bics))))
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+lines(x, pred_series_arma, col = "blue")
+lines(x, pred_series_garch, col = "green")
+lines(x, pred_series_arma_garch, col = "purple")
+legend("bottom", legend = c("Truth", "White Noise", "ARMA", "GARCH", "ARMA + GARCH"),
+       col = c("black", "red", "blue", "green", "purple"), lty = 1)
+```
+
+## GCV
+
+```{r, include = FALSE}
+library(npreg)
+
+res <- gsm(arma_garch_series ~ x, method = "BIC")
+plot(x, fitted(res), type = "l")
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_wn, col = "red")
+lines(x, pred_series_arma, col = "blue")
+lines(x, pred_series_garch, col = "green")
+lines(x, pred_series_arma_garch, col = "purple")
+lines(x, fitted(res), col = "pink")
+legend("bottom", legend = c("Truth", "White Noise", "ARMA", "GARCH", "ARMA + GARCH", "ss GCV"),
+       col = c("black", "red", "blue", "green", "purple", "pink"), lty = 1)
+
+
+plot(x, y_true, type = "l")
+lines(x, fitted(res), col = "pink")
+```
+
+
+## What if we use bsts?
+
+```{r}
+ss <- list()
+ss <- bsts::AddLocalLinearTrend(ss, arma_garch_series)
+## ss <- bsts::AddAutoAr(ss, arma_garch_series, lags = 1)
+ss <- bsts::AddLocalLevel(ss, arma_garch_series)
+mod <- bsts::bsts(arma_garch_series, ss, niter = 1000)
+
+pred_series_arma_garch <- colMeans(mod$state.contributions[,1,])
+
+
+plot(x, y_true, type = "l")
+lines(x, pred_series_arma_garch, col = "purple")
+```
+
+
+## How does the "true" structure handle this noise? (arma - garch)
+
+```{r}
+gexp <- expand.grid(0:4, 0:4, 0:4, 0:4)
+gexp <- gexp %>%
+  dplyr::mutate(f1 = Var1 + Var2, f2 = Var3 + Var4) %>%
+  dplyr::filter(Var3 != 0 & f1 != 0)
+bics_exp <- numeric(nrow(gexp))
+for (j in 1:nrow(gexp)) {
+  
+  ar1 <- gexp[j,1]
+  ma1 <- gexp[j,2]
+  a1 <- gexp[j,3]
+  b1 <- gexp[j,4]
+  
+  if (j %% 10 == 0) {print(j)}
+  
+    tryCatch({
+    
+      tmp <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(ar1, ma1)),
+                                         variance.model = list(garchOrder = c(a1, b1))), data = arma_garch_series)
+    
+      
+      bics_exp[j] <- -2*tmp@fit$LLH + length(tmp@fit$coef)*log(length(arma_garch_series))
+      
+    },
+           error = function(e) {
+             print("SHHHHHH")
+             bics_exp[j] <- 9999
+             }
+  )
+ 
+}
+
+
+gexp[which.min(bics_exp),]
+min(bics_exp)
+
+s_fit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(2, 3)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = arma_garch_series)
+vals <- fitted(s_fit)
+mean_vals <- as.numeric(vals)
+
+plot(x, y_true, type = "l")
+lines(x, arma_garch_series, col = "blue")
+## lines(x, pred_series_arma_garch, col = "purple")
+lines(x, mean_vals, col = "orange")
+
+plot.ts(s_fit@fit$sigma)
+```

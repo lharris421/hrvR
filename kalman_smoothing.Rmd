@@ -1,0 +1,192 @@
+---
+title: "Splines and Kalman Smoothing"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+## Libraries
+library(tidyverse)
+library(rugarch)
+library(npreg)
+library(magrittr)
+library(splines)
+library(patchwork)
+library(magrittr)
+library(tseries)
+library(kableExtra)
+library(lubridate)
+library(FITfileR)
+```
+
+```{r, out.width="70%", out.height="70%", out.extra='style="float:right; padding:5px"'}
+starting_hr <- 80
+terminal_hr <- 150 
+ride_length <- 90 ## 90
+observations_per_minute <- 60
+
+minutes_to_terminal <- 30 ## 30
+seconds_to_terminal <- 60 * minutes_to_terminal
+
+hrs <- terminal_hr - (terminal_hr - starting_hr)^(1 - (1:seconds_to_terminal / seconds_to_terminal)) + 1
+hrs <- c(hrs, rep(terminal_hr, (ride_length - minutes_to_terminal) * 60))
+```
+
+```{r, out.width="60%", out.height="60%", out.extra='style="float:right; padding:5px"'}
+starting_var <- 120 ## May conisder moving this down
+starting_hr <- 50
+terminal_hr <- 190
+hr_diff <- terminal_hr - starting_hr
+
+var_curve <- ((starting_var)*(exp(- seq(0, hr_diff, 1) / hr_diff ))^4)^2
+matching_hrs <- seq(starting_hr, terminal_hr, length.out = length(var_curve))
+```
+
+```{r, out.width="70%", out.height="70%", fig.align = "center"}
+dm <- var_curve * (matching_hrs^4) / (60000^2)
+dm_smooth <- loess(dm ~ matching_hrs)
+```
+
+```{r, out.width="80%", out.height="70%", fig.align = "center"}
+set.seed(111322)
+ar_process <- numeric(length(hrs))
+ar_process[1] <- hrs[1]
+ar_addition <- numeric(length(hrs))
+hetero_noise <- numeric(length(hrs))
+for (i in 2:length(hrs)) {
+
+  curr_sd <- sqrt(predict(dm_smooth, data.frame(matching_hrs = ar_process[i - 1])))
+  hetero_noise[i] <- rnorm(1, 0, curr_sd)
+  ar_addition[i] <- (.98 * (ar_process[i - 1] - hrs[i - 1]))
+  ar_process[i] <- round(hrs[i] + ar_addition[i] + hetero_noise[i])
+  ar_process[i] <- pmax(50, ar_process[i])
+  ar_process[i] <- pmin(190, ar_process[i])
+  
+}
+
+hr_data <- data.frame(ar_process, x = 1:length(ar_process))
+
+tmp <- data.frame(
+  x = 1:length(ar_process), y = ar_process
+)
+
+ggplot(tmp, aes(x = x, y = y)) +
+  geom_line() +
+  ylab("Heart Rate (BPM)") +
+  xlab("Time (seconds)") +
+  theme_bw()
+
+tmp2 <- data.frame(
+  x = 1:length(hrs), y = hrs
+)
+
+ggplot(tmp2, aes(x = x, y = y)) +
+  geom_line() +
+  ylab("Heart Rate (BPM)") +
+  xlab("Time (seconds)") +
+  theme_bw()
+```
+
+## Fitting the smoother
+
+```{r}
+library(astsa)
+
+## State Space ## 
+y <- ar_process
+Phi <- matrix(c(2, 1, -1, 0), 2)
+A <- matrix(c(1, 0), 1)
+mu0 <- matrix(0, 2)
+Sigma0 <- diag(1, 2)
+
+Linn <- function(para) {
+  
+  sigw = para[1]
+  sigv = para[2]
+  cQ = diag(c(sigw, 0))
+  kf = Kfilter(y, A, mu0, Sigma0, Phi, sQ = t(cQ), sR = t(sigv))
+  return(kf$like) 
+
+}
+
+## Estimation ##
+init_par <- c(.1, 1) 
+
+(est <- optim(
+  init_par, 
+  Linn, 
+  NULL, 
+  method = "BFGS", 
+  hessian = TRUE,
+  control = list(trace = 1, REPORT = 1)
+  )
+)
+
+SE <- sqrt(diag(solve(est$hessian)))
+
+# output
+estimate <- est$par
+u <- cbind(estimate, SE)
+rownames(u) <- c("sigw","sigv"); u
+
+# Smooth
+sigw <- est$par[1]
+cQ <- diag(c(sigw,0))
+sigv <- est$par[2]
+ks <- Ksmooth(y,A,mu0,Sigma0,Phi,sQ = t(cQ), sR = t(sigv))
+xsmoo <- ts(ks$Xs[1,1,])
+psmoo <- ts(ks$Ps[1,1,])
+upp <- xsmoo+2*sqrt(psmoo)
+low <- xsmoo-2*sqrt(psmoo)
+
+plot.ts(ar_process)
+lines(xsmoo, col=4, lty=2, lwd=3)
+
+plot.ts(ar_process - xsmoo)
+```
+
+```{r, warning = FALSE, fig.height=4, fig.width=8, fig.align = "center"}
+get_rsd <- function(fitted) {
+  
+  process_data <- data.frame(noise = ar_process - fitted, x = ar_process)
+  hr_seq <- seq(min(ar_process), max(ar_process), by = 1)
+  rsd <- numeric(length(hr_seq))
+  
+  for (i in 1:length(hr_seq)) {
+  
+  rsd[i] <- process_data %>%
+    filter(abs(x - hr_seq[i]) <= 10) %>%
+    pull(noise) %>%
+    sd()
+  
+  }
+  
+  return(rsd)
+  
+}
+
+hr_seq <- seq(min(ar_process), max(ar_process), by = 1)
+dm_match <- dm[matching_hrs %in% hr_seq]
+hr_match <- matching_hrs[matching_hrs %in% hr_seq]
+
+rsd_df_bs <- bind_cols(get_rsd(xsmoo))
+colnames(rsd_df_bs) <- "ks"
+rsd_df_bs$Truth <- sqrt(dm_match)
+rsd_df_bs$hr_seq <- hr_seq
+
+rsd_df_bs_long <- rsd_df_bs %>%
+  pivot_longer(cols = c(ks:Truth), names_to = "Criteria", values_to = "Value") %>%
+  mutate(Criteria = factor(Criteria, levels = c("Truth", "ks")))
+
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+ggplot() +
+  geom_line(data = rsd_df_bs_long, aes(x = hr_seq, y = Value, color = Criteria, group = Criteria)) +
+  ylab("SD (BPM)") +
+  xlab("Heart Rate (BPM)") +
+  theme_bw() +
+  ylim(c(-8, 8)) +
+  scale_colour_manual(values=cbbPalette)
+```

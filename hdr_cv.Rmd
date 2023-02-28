@@ -1,0 +1,185 @@
+---
+title: "Holy Double Random Cross Validation"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+## X-range : 90 minutes
+x <- seq(0, 90, by = 1/20)
+
+## Setting a mean trend
+y_init <- (-.00075*x^3 + .0575*x^2 - 17)*(x > 20 & x <= 80) -.2*(x - 20)^2*(x <= 20) + 160 - 33*(x > 80)
+
+## Getting a smooth mean trend with splines
+sfit <- lm(y_init ~ ns(x, 10))
+y_true <- sfit$fitted.values
+
+set.seed(1113)
+arma_garch_noise <- garchSim(spec = garchSpec(model = list(omega = .15, alpha = .2, beta = .75, ar = .98, ma = .3, mu = 2)), n = length(x))
+
+# x <- 1:length(arma_garch_noise)
+# y <- arma_garch_series
+# tst <- ggplot(data.frame(x = x, y = y), aes(x = x, y = y)) +
+#   geom_line()
+
+## ggsave(file = "save_test2.pdf", width = 12, height = 2, dpi = 300)
+
+arma_garch_noise <- arma_garch_noise$garch - mean(arma_garch_noise$garch)
+arma_garch_noise <- arma_garch_noise * .6
+
+arma_garch_series <- y_true + arma_garch_noise 
+
+## Looks most feasible
+plot(x, arma_garch_series, type = "l")
+
+
+plot.ts(arma_garch_noise)
+
+ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                                    variance.model = list(garchOrder = c(1, 1))), data = arma_garch_noise)
+```
+
+
+```{r, warning = FALSE}
+objective <- function(lambda, subset, series, x) {
+  
+  series_fit <- series[-subset]
+  x_fit <- x[-subset]
+  mod <- gsm(series_fit ~ x_fit, lambda = lambda, control = list(maxit = 100, epsilon = 1e-9))
+  projected_y <- predict(mod, newdata = data.frame(x_fit = x[subset]))
+  mean((series[subset] - projected_y)^2)
+  
+}
+
+props <- seq(.1, .5, by = .05)
+nit <- 10
+lcs <- numeric(length(props))
+for (j in 1:length(props)) {
+  
+  prop <- props[j] 
+  
+  lambdas <- numeric(nit)
+  for (i in 1:nit) {
+    
+    rem <- sort(sample(1:length(x), round(prop*length(x))))
+    if (i == nit) {print(length(rem))}
+    lambdas[i] <- optimise(objective, interval = c(1e-10, 1 - 1e-10), subset = rem, series = arma_garch_series, x = x)$minimum
+    
+  }
+  
+  lcs[j] <- mean(lambdas)
+  print(j)
+  
+}
+
+
+## 10 fold cv
+
+assignments <- ((1:length(x) %% 10) + 1)
+new_range <- c(min(lcs), max(lcs))
+## new_range <- c(1e-10, 1 - 1e-10)
+lambdas_step2 <- numeric(10)
+for (i in 1:10) {
+    
+    rem <- (1:length(x))[assignments == i]
+    ## print(head(rem))
+    lambdas_step2[i] <- optimise(objective, interval = new_range, subset = rem, series = arma_garch_series, x = x)$minimum
+    
+}
+
+mean(lcs)
+mean(lambdas_step2)
+
+res <- gsm(arma_garch_series ~ x, lambda = mean(lambdas_step2), control = list(maxit = 100, epsilon = 1e-9))
+
+plot(x, y_true, type = "l")
+lines(x, fitted(res), col = "pink")
+
+res <- gsm(arma_garch_series ~ x, lambda = mean(lcs), control = list(maxit = 100, epsilon = 1e-9))
+
+plot(x, y_true, type = "l")
+lines(x, fitted(res), col = "pink")
+
+
+plot.ts(arma_garch_series - fitted(res))
+
+## trying to get accurate alpha and beta
+sfit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(1, 1)),
+                                    variance.model = list(garchOrder = c(1, 1))), data = (arma_garch_series - fitted(res)))
+    
+ys <- sfit@fit$sigma
+
+sfit
+
+plot.ts(ys)
+```
+
+- iterative optimization?
+
+- Need to work in oracle some how
+
+```{r, warning = FALSE}
+objective_ns <- function(df, subset, series, x) {
+  
+  series_fit <- series[-subset]
+  x_fit <- x[-subset]
+  df <- round(df)
+  mod <- lm(series_fit ~ ns(x_fit, df))
+  projected_y <- predict(mod, newdata = data.frame(x_fit = x[subset]))
+  ## (mean((true_y[subset] - projected_y)^2) + ((df^2) / length(true_y)))
+  ## (mean((true_y[subset] - projected_y)^2) + (df / sqrt(length(true_y))))
+  ## mean((true_y[subset] - projected_y)^2)^(1 + (df / length(true_y)))
+  mean((series[subset] - projected_y)^2)^(1 + (df / length(series)))
+  
+}
+
+props <- .5
+lcs <- numeric(length(props))
+for (j in 1:length(props)) {
+  
+  prop <- props[j] 
+  
+  nit <- 10
+  lambdas <- numeric(nit)
+  for (i in 1:nit) {
+    
+    rem <- sort(sample(1:length(x), round(prop*length(x))))
+    lambdas[i] <- optimise(objective_ns, interval = c(1, 1000), subset = rem, series = arma_garch_series, x = x)$minimum
+    
+  }
+  
+  lcs[j] <- mean(lambdas)
+  print(j)
+  
+}
+
+
+
+lcs <- round(lcs)
+
+res <- lm(arma_garch_series ~ ns(x, lcs))
+
+plot(x, y_true, type = "l")
+lines(x, fitted(res), col = "red")
+
+
+plot.ts(arma_garch_series - fitted(res))
+
+
+sfit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                                    variance.model = list(garchOrder = c(1, 1))), data = (arma_garch_series - fitted(res)))
+    
+ys <- sfit@fit$sigma
+
+sfit
+
+plot.ts(ys)
+```

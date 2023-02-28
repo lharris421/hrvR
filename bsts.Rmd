@@ -1,0 +1,134 @@
+---
+title: "Bayesian Structure Time Series"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r}
+library(FITfileR)
+library(magrittr)
+library(dplyr)
+library(tseries)
+library(fGarch)
+library(lubridate)
+library(readr)
+library(data.table)
+library(janitor)
+library(bit64)
+library(stringr)
+library(splines)
+library(ggplot2)
+library(rugarch)
+```
+
+## BSTS Exploration
+
+```{r}
+library(bsts)
+
+## recs <- records(readFitFile("example_files/Afternoon_Gravel_Ride.fit")) 
+recs <- records(readFitFile("example_files/Lunch_Gravel_Ride.fit")) 
+if (!("list" %in% class(recs))) {recs <- list(recs)}
+hr_data <- do.call(rbind, lapply(recs, function(x) x %>% dplyr::select(timestamp, heart_rate))) %>%
+    dplyr::arrange(timestamp) %>%
+    dplyr::mutate(tdiff = c(1, diff(timestamp)),
+                  orig = 1)
+  
+  min_time <- min(hr_data$timestamp)
+  max_time <- max(hr_data$timestamp)
+  all_times <-  seq(min_time, max_time, by = 1)
+  all_times <- all_times[!(all_times %in% hr_data$timestamp)]
+  all_ts <- data.frame(timestamp = all_times, heart_rate = NA) 
+  
+  hr_data %<>% full_join(all_ts) %>%
+    arrange(timestamp) %>%
+    mutate(bef = heart_rate,
+           aft = heart_rate) %>%
+    tidyr::fill(bef, .direction = "down") %>%
+    tidyr::fill(aft, .direction = "up") %>%
+    tidyr::fill(tdiff, .direction = "up") %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(bef_weight = n():1) %>%
+    ungroup() %>%
+    arrange(desc(timestamp)) %>%
+    mutate(group = cumsum(!is.na(heart_rate))) %>%
+    group_by(group) %>%
+    mutate(aft_weight = n():1) %>%
+    ungroup() %>%
+    arrange(timestamp) %>%
+    mutate(heart_rate = ifelse(is.na(heart_rate), (bef*bef_weight + aft*aft_weight) / (bef_weight + aft_weight), heart_rate)) %>%
+    arrange(timestamp) %>%
+    mutate(heart_rate = 60000 / heart_rate)
+  
+
+ss <- list()
+ss <- bsts::AddSemilocalLinearTrend(ss, hr_data$heart_rate)
+mod <- bsts::bsts(hr_data$heart_rate, ss, niter = 500)
+
+plot.ts(mod$one.step.prediction.errors[1,])
+plot.ts(mod$one.step.prediction.errors[2,])
+plot.ts(mod$one.step.prediction.errors[3,])
+
+
+pred_errors <- apply(mod$one.step.prediction.errors, 2, median)
+## plot.ts(pred_errors)
+ 
+library(bayesforecast)
+stan_SVM(pred_errors)
+ 
+
+
+sfit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = pred_errors)
+
+plot.ts(sfit@fit$sigma)
+
+
+xs <- 60000 / hr_data$heart_rate
+ys <- sfit@fit$sigma
+
+dat_pred <- bind_cols(ys, xs) %>%
+  arrange(xs)
+colnames(dat_pred) <- c("Y", "X")
+mod_pred <- lm(Y ~ ns(X, 2), dat_pred)
+
+predict(mod_pred, newdata = data.frame(X = 45))
+
+plot(xs, log(ys))
+lines(seq(100, 190, 1), predict(mod_pred, newdata = data.frame(X = seq(100, 190, 1))), col = "red")
+```
+
+## Model as exponential decay
+
+```{r}
+# Select an approximate $\theta$, since theta must be lower than min(y), and greater than zero
+theta.0 <- min(ys) * 0.5  
+
+# Estimate the rest parameters using a linear model
+model.0 <- lm(log(ys - theta.0) ~ xs)  
+alpha.0 <- exp(coef(model.0)[1])
+beta.0 <- coef(model.0)[2]
+
+# Starting parameters
+start <- list(alpha = alpha.0, beta = beta.0, theta = theta.0)
+
+
+mod_pred <- nls(ys ~ alpha * exp(beta * xs) + theta, start = start)
+
+
+plot(xs, ys, ylim = c(0, 10))
+lines(seq(100, 190, 1), predict(mod_pred, newdata = data.frame(xs = seq(100, 190, 1))), col = "red")
+
+predict(mod_pred, newdata = data.frame(xs = 140)) ## 1.487, 1.432
+predict(mod_pred, newdata = data.frame(xs = 45)) ## 1.487, 1.432
+```
+
+

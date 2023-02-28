@@ -1,0 +1,190 @@
+---
+title: "HR Sim"
+author: "Logan Harris"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# New attempt
+
+```{r}
+starting_hr <- 80
+terminal_hr <- 150 
+ride_length <- 90
+observations_per_minute <- 60
+
+minutes_to_terminal <- 30
+seconds_to_terminal <- 60 * minutes_to_terminal
+
+hrs <- terminal_hr - round((terminal_hr - starting_hr + 1)^(1 - (1:seconds_to_terminal / seconds_to_terminal)) - 1)
+hrs <- c(hrs, rep(terminal_hr, (ride_length - minutes_to_terminal) * 60))
+plot.ts(hrs)
+
+
+
+## Time between beats
+plot.ts(60000 / hrs)
+
+## Variance curve
+starting_var <- 120
+starting_hr <- 50
+terminal_hr <- 190
+hr_diff <- terminal_hr - starting_hr
+
+## var_curve <- (((starting_var + 1)^(1 - (seq(0, hr_diff, 1) / hr_diff))) - 1)^2
+var_curve <- ((starting_var)*(exp(- seq(0, hr_diff, 1) / hr_diff ))^4)^2
+## var_curve <- ((starting_var^2)*(1 - (seq(0, hr_diff, 1)^2 / hr_diff^2)))
+
+## var_curve <- (starting_var^2 + (997.2299)) * (1 - (seq(starting_hr, terminal_hr, 1) / terminal_hr)^2 + (starting_hr / terminal_hr)^2) - (997.2299)
+sqrt(min(var_curve))
+sqrt(max(var_curve))
+
+matching_hrs <- seq(starting_hr, terminal_hr, length.out = length(var_curve))
+
+plot(matching_hrs^2, var_curve, type = "l")
+
+plot(matching_hrs, var_curve, type = "l")
+plot(matching_hrs, sqrt(var_curve), type = "l")
+## plot(matching_hrs, log(sqrt(var_curve)), type = "l")
+
+## Can I get a relationship here that would allow garch to be correct? Linear wrt var vs. y^2????
+## This may be more important than getting linear wrt the relationship between heart rate and hrv since this can be easily estimated afterwards
+
+## This may be what the curve could look like?
+## So this is going to be an exploration but does not directly apply to the end goal
+
+## Time between
+plot((60000 / matching_hrs), var_curve, type = "l")
+plot((60000 / matching_hrs), sqrt(var_curve), type = "l")
+
+
+
+## delta methods
+## dm <- var_curve * (60000^2) * (1 / ((60000 / matching_hrs)^4))
+dm <- var_curve * (matching_hrs^4) / (60000^2)
+plot(matching_hrs, sqrt(dm) , type = "l")
+min(dm)
+
+dm_smooth <- loess(dm ~ matching_hrs)
+sqrt(predict(dm_smooth, data.frame(matching_hrs = 150)))
+```
+
+## Add ar
+
+```{r}
+## Change underlying process to be continuous?
+## Only alter the observed process?
+set.seed(111322)
+ar_process <- numeric(length(hrs))
+ar_process[1] <- hrs[1]
+ar_addition <- numeric(length(hrs))
+hetero_noise <- numeric(length(hrs))
+for (i in 2:length(hrs)) {
+### for (i in 2:3) {  
+
+  ## flipped back
+  curr_sd <- sqrt(predict(dm_smooth, data.frame(matching_hrs = ar_process[i - 1])))
+  hetero_noise[i] <- rnorm(1, 0, curr_sd)
+  ar_addition[i] <- (.98 * (ar_process[i - 1] - hrs[i - 1]))
+  ar_process[i] <- round(hrs[i] + ar_addition[i] + hetero_noise[i])
+  ar_process[i] <- pmax(50, ar_process[i])
+  ar_process[i] <- pmin(190, ar_process[i])
+  
+  
+}
+
+plot.ts(hrs)
+plot.ts(ar_addition)
+plot.ts(round(ar_addition + hrs))
+plot.ts(hetero_noise)
+plot.ts(ar_process)
+
+plot(ar_process, abs(hetero_noise))
+
+mod <- loess(abs(hetero_noise) ~ ar_process, span = .5)
+
+plot(ar_process, abs(hetero_noise))
+lines(matching_hrs, predict(mod, newdata = data.frame(ar_process = matching_hrs)), col = "red")
+lines(matching_hrs, sqrt(dm), col = "red")
+
+
+## Fit a garch model to this to extract the variance
+garch_fit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = hetero_noise)
+
+
+## Look at the relationship
+st <- garch_fit@fit$sigma
+plot(ar_process, st)
+
+## Look at the lagged relationship
+plot(ar_process[-length(ar_process)], st[-1])
+
+arp <- ar_process[-length(ar_process)]
+stp <- st[-1]
+
+mod <- loess(stp ~ arp)
+plot(arp, stp)
+lines(matching_hrs, predict(mod, newdata = data.frame(arp = matching_hrs)), col = "blue")
+## lines(ar_process, fitted(loess(st ~ ar_process)), col = "blue")
+lines(matching_hrs, sqrt(dm), col = "red")
+
+
+```
+
+## As HRV
+
+```{r}
+tb <- 60000 / ar_process
+plot.ts(tb)
+
+library(splines)
+
+sfit <- lm(tb ~ ns(1:length(tb)))
+
+bics <- numeric(1000)
+for (i in 1:1000) {
+  
+  bics[i] <- BIC(lm(tb ~ ns(1:length(tb), df = i)))
+  
+}
+
+plot(1:1000, bics)
+
+which.min(bics)
+
+final_mod <- lm(tb ~ ns(1:length(tb), df = 573))
+
+plot.ts(final_mod$fitted.values)
+plot.ts(tb - final_mod$fitted.values)
+
+noise_left <- tb - final_mod$fitted.values
+
+garch_fit <- ugarchfit(spec = ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                                         variance.model = list(garchOrder = c(1, 1))), data = noise_left)
+
+
+## Look back at
+
+## Look at the relationship
+st <- garch_fit@fit$sigma
+plot(tb, st)
+
+tbp <- tb[-length(tb)]
+stp <- st[-1]
+plot(tbp, stp)
+
+mod <- loess(stp ~ tbp)
+plot(tbp, stp)
+matching_tbs <- 60000 / matching_hrs
+lines(matching_tbs, predict(mod, newdata = data.frame(tbp = matching_tbs)), col = "blue")
+lines(matching_tbs, sqrt(var_curve), col = "red")
+```
+
+
+
+
